@@ -1,0 +1,323 @@
+// @version=6
+strategy("TJR Strategy 2 - Multi-Timeframe Key Levels", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=2, max_boxes_count=500, max_lines_count=500)
+
+// === INPUT PARAMETERS ===
+var g1 = "=== Key Level Settings ==="
+showPreviousSessionHighs = input.bool(true, "Show Previous Session Highs", group=g1)
+show1HourHighs = input.bool(true, "Show 1 Hour Highs", group=g1)
+show4HourHighs = input.bool(true, "Show 4 Hour Highs", group=g1)
+keyLevelLookback = input.int(10, "Key Level Lookback Period", minval=5, maxval=50, group=g1)
+
+var g2 = "=== Sweep Detection ==="
+sweepThreshold = input.float(0.1, "Sweep Threshold %", minval=0.01, maxval=1.0, step=0.01, group=g2)
+confirmationBars = input.int(2, "Confirmation Bars for Sweep", minval=1, maxval=5, group=g2)
+
+var g3 = "=== Trend Change Detection ==="
+useIFVG = input.bool(true, "Use Inverse Fair Value Gap", group=g3)
+useBOS = input.bool(true, "Use Break of Structure", group=g3)
+useFibExtension = input.bool(true, "Use 79% Fib Extension", group=g3)
+fibExtensionLevel = input.float(0.79, "Fibonacci Extension Level", minval=0.5, maxval=1.0, step=0.01, group=g3)
+
+var g4 = "=== Continuation Patterns ==="
+useFVG = input.bool(true, "Use Fair Value Gap", group=g4)
+useOrderBlock = input.bool(true, "Use Order Block", group=g4)
+useEquilibrium = input.bool(true, "Use Equilibrium", group=g4)
+useBreakerBlock = input.bool(true, "Use Breaker Block", group=g4)
+
+var g5 = "=== Risk Management ==="
+riskRewardRatio = input.float(2.0, "Risk:Reward Ratio", minval=1.0, maxval=5.0, step=0.1, group=g5)
+useTrailingStop = input.bool(false, "Use Trailing Stop", group=g5)
+
+var g6 = "=== Visual Settings ==="
+showKeyLevels = input.bool(true, "Show Key Levels", group=g6)
+showSweeps = input.bool(true, "Show Liquidity Sweeps", group=g6)
+showEntryZones = input.bool(true, "Show Entry Zones", group=g6)
+showTrendChange = input.bool(true, "Show Trend Change Signals", group=g6)
+
+// === HELPER FUNCTIONS ===
+
+// Get higher timeframe data
+prevSessionHigh = request.security(syminfo.tickerid, "1D", high[1], lookahead=barmerge.lookahead_off)
+hour1High = request.security(syminfo.tickerid, "60", ta.highest(high, keyLevelLookback), lookahead=barmerge.lookahead_off)
+hour4High = request.security(syminfo.tickerid, "240", ta.highest(high, keyLevelLookback), lookahead=barmerge.lookahead_off)
+prevSessionLow = request.security(syminfo.tickerid, "1D", low[1], lookahead=barmerge.lookahead_off)
+hour1Low = request.security(syminfo.tickerid, "60", ta.lowest(low, keyLevelLookback), lookahead=barmerge.lookahead_off)
+hour4Low = request.security(syminfo.tickerid, "240", ta.lowest(low, keyLevelLookback), lookahead=barmerge.lookahead_off)
+
+// === KEY LEVEL DETECTION ===
+// Key levels are now calculated directly above
+
+// === LIQUIDITY SWEEP DETECTION ===
+var bool prevSessionHighSwept = false
+var bool hour1HighSwept = false
+var bool hour4HighSwept = false
+var bool prevSessionLowSwept = false
+var bool hour1LowSwept = false
+var bool hour4LowSwept = false
+var int sweepBar = na
+var float sweptLevel = na
+var bool bullishSweep = false
+var bool bearishSweep = false
+
+// Detect sweeps
+sweepThresholdPoints = close * sweepThreshold / 100
+
+// High sweeps (bearish liquidity grab)
+if not na(prevSessionHigh) and high > prevSessionHigh + sweepThresholdPoints and close < prevSessionHigh and not prevSessionHighSwept
+    prevSessionHighSwept := true
+    sweepBar := bar_index
+    sweptLevel := prevSessionHigh
+    bearishSweep := true
+
+if not na(hour1High) and high > hour1High + sweepThresholdPoints and close < hour1High and not hour1HighSwept
+    hour1HighSwept := true
+    sweepBar := bar_index
+    sweptLevel := hour1High
+    bearishSweep := true
+
+if not na(hour4High) and high > hour4High + sweepThresholdPoints and close < hour4High and not hour4HighSwept
+    hour4HighSwept := true
+    sweepBar := bar_index
+    sweptLevel := hour4High
+    bearishSweep := true
+
+// Low sweeps (bullish liquidity grab)
+if not na(prevSessionLow) and low < prevSessionLow - sweepThresholdPoints and close > prevSessionLow and not prevSessionLowSwept
+    prevSessionLowSwept := true
+    sweepBar := bar_index
+    sweptLevel := prevSessionLow
+    bullishSweep := true
+
+if not na(hour1Low) and low < hour1Low - sweepThresholdPoints and close > hour1Low and not hour1LowSwept
+    hour1LowSwept := true
+    sweepBar := bar_index
+    sweptLevel := hour1Low
+    bullishSweep := true
+
+if not na(hour4Low) and low < hour4Low - sweepThresholdPoints and close > hour4Low and not hour4LowSwept
+    hour4LowSwept := true
+    sweepBar := bar_index
+    sweptLevel := hour4Low
+    bullishSweep := true
+
+// === TREND CHANGE DETECTION ===
+var bool trendChangeConfirmed = false
+var bool lookingForTrendChange = false
+var string trendChangeType = ""
+
+// Start looking for trend change after sweep
+if (bullishSweep or bearishSweep) and not lookingForTrendChange
+    lookingForTrendChange := true
+    trendChangeConfirmed := false
+
+// Detect Inverse Fair Value Gap (IFVG)
+detectIFVG() =>
+    // Bullish IFVG: high[2] < low (gap filled by current candle)
+    bullishIFVG = useIFVG and high[2] < low and not na(high[2])
+    // Bearish IFVG: low[2] > high (gap filled by current candle)
+    bearishIFVG = useIFVG and low[2] > high and not na(low[2])
+    [bullishIFVG, bearishIFVG]
+
+// Detect Break of Structure
+detectBOS() =>
+    // Simple BOS detection
+    recentHigh = ta.highest(high, 10)
+    recentLow = ta.lowest(low, 10)
+    bullishBOS = useBOS and high > recentHigh[1]
+    bearishBOS = useBOS and low < recentLow[1]
+    [bullishBOS, bearishBOS]
+
+// Calculate swing data for Fibonacci Extension
+swingHigh = ta.highest(high, 20)
+swingLow = ta.lowest(low, 20)
+
+// Detect Fibonacci Extension
+detectFibExtension() =>
+    if useFibExtension and bar_index >= sweepBar + 3
+        // Calculate swing range
+        swingRange = swingHigh - swingLow
+        fibLevel = swingLow + (swingRange * fibExtensionLevel)
+        
+        bullishFib = close > fibLevel and close[1] <= fibLevel
+        bearishFib = close < fibLevel and close[1] >= fibLevel
+        [bullishFib, bearishFib]
+    else
+        [false, false]
+
+// Check for trend change signals
+[ifvgBull, ifvgBear] = detectIFVG()
+[bosBull, bosBear] = detectBOS()
+[fibBull, fibBear] = detectFibExtension()
+
+if lookingForTrendChange and not trendChangeConfirmed
+    if (ifvgBull or bosBull or fibBull) and bearishSweep
+        trendChangeConfirmed := true
+        trendChangeType := "Bullish"
+    else if (ifvgBear or bosBear or fibBear) and bullishSweep
+        trendChangeConfirmed := true
+        trendChangeType := "Bearish"
+
+// === CONTINUATION PATTERN DETECTION ===
+var bool waitingForEntry = false
+var float entryZoneHigh = na
+var float entryZoneLow = na
+var string continuationPattern = ""
+
+// Detect Fair Value Gap
+detectFVG() =>
+    // Bullish FVG: low[2] > high
+    bullishFVG = useFVG and low[2] > high and not na(low[2])
+    // Bearish FVG: high[2] < low
+    bearishFVG = useFVG and high[2] < low and not na(high[2])
+    [bullishFVG, bearishFVG]
+
+// Detect Order Block
+detectOrderBlock() =>
+    // Bullish OB: Last bearish candle before bullish move
+    bullishOB = useOrderBlock and close[1] < open[1] and close > open and close > close[1]
+    // Bearish OB: Last bullish candle before bearish move
+    bearishOB = useOrderBlock and close[1] > open[1] and close < open and close < close[1]
+    [bullishOB, bearishOB]
+
+// Calculate equilibrium data
+equilibriumLevel = (swingHigh + swingLow) / 2
+
+// Detect Equilibrium
+detectEquilibrium() =>
+    if useEquilibrium
+        nearEquilibrium = math.abs(close - equilibriumLevel) < (swingHigh - swingLow) * 0.1
+        [nearEquilibrium, equilibriumLevel]
+    else
+        [false, na]
+
+// Detect Breaker Block
+detectBreakerBlock() =>
+    // Simplified breaker block: Previous support becomes resistance or vice versa
+    bullishBreaker = useBreakerBlock and low[5] < low[4] and low[4] < low[3] and high > high[3]
+    bearishBreaker = useBreakerBlock and high[5] > high[4] and high[4] > high[3] and low < low[3]
+    [bullishBreaker, bearishBreaker]
+
+// Get continuation pattern signals
+[fvgBull, fvgBear] = detectFVG()
+[obBull, obBear] = detectOrderBlock()
+[nearEq, eqLevel] = detectEquilibrium()
+[bbBull, bbBear] = detectBreakerBlock()
+
+// Look for continuation patterns after trend change
+if trendChangeConfirmed and not waitingForEntry
+    
+    if trendChangeType == "Bullish" and (fvgBull or obBull or nearEq or bbBull)
+        waitingForEntry := true
+        if fvgBull
+            entryZoneHigh := low[2]
+            entryZoneLow := high
+            continuationPattern := "FVG"
+        else if obBull
+            entryZoneHigh := math.max(open[1], close[1])
+            entryZoneLow := math.min(open[1], close[1])
+            continuationPattern := "Order Block"
+        else if nearEq
+            entryZoneHigh := eqLevel + (eqLevel * 0.01)
+            entryZoneLow := eqLevel - (eqLevel * 0.01)
+            continuationPattern := "Equilibrium"
+        else if bbBull
+            entryZoneHigh := high[3] + (high[3] * 0.005)
+            entryZoneLow := high[3] - (high[3] * 0.005)
+            continuationPattern := "Breaker Block"
+    
+    else if trendChangeType == "Bearish" and (fvgBear or obBear or nearEq or bbBear)
+        waitingForEntry := true
+        if fvgBear
+            entryZoneHigh := low
+            entryZoneLow := high[2]
+            continuationPattern := "FVG"
+        else if obBear
+            entryZoneHigh := math.max(open[1], close[1])
+            entryZoneLow := math.min(open[1], close[1])
+            continuationPattern := "Order Block"
+        else if nearEq
+            entryZoneHigh := eqLevel + (eqLevel * 0.01)
+            entryZoneLow := eqLevel - (eqLevel * 0.01)
+            continuationPattern := "Equilibrium"
+        else if bbBear
+            entryZoneHigh := low[3] + (low[3] * 0.005)
+            entryZoneLow := low[3] - (low[3] * 0.005)
+            continuationPattern := "Breaker Block"
+
+// === TRADE EXECUTION ===
+var float stopLoss = na
+var float takeProfit = na
+
+// Entry logic: Wait for candle to enter and exit the continuation zone
+if waitingForEntry and not na(entryZoneHigh) and not na(entryZoneLow)
+    // Check if price entered the zone
+    enteredZone = low <= entryZoneHigh and high >= entryZoneLow
+    
+    if enteredZone
+        // Check for breakout direction
+        if trendChangeType == "Bullish" and close > entryZoneHigh
+            // Long entry
+            stopLoss := sweptLevel
+            riskAmount = close - stopLoss
+            takeProfit := close + (riskAmount * riskRewardRatio)
+            
+            strategy.entry("Long", strategy.long)
+            strategy.exit("Long Exit", "Long", stop=stopLoss, limit=takeProfit)
+            
+            waitingForEntry := false
+            lookingForTrendChange := false
+            
+        else if trendChangeType == "Bearish" and close < entryZoneLow
+            // Short entry
+            stopLoss := sweptLevel
+            riskAmount = stopLoss - close
+            takeProfit := close - (riskAmount * riskRewardRatio)
+            
+            strategy.entry("Short", strategy.short)
+            strategy.exit("Short Exit", "Short", stop=stopLoss, limit=takeProfit)
+            
+            waitingForEntry := false
+            lookingForTrendChange := false
+
+// === VISUAL ELEMENTS ===
+
+// Plot key levels
+plot(showKeyLevels and showPreviousSessionHighs ? prevSessionHigh : na, "Prev Session High", color=color.purple, linewidth=2, style=plot.style_line)
+plot(showKeyLevels and show1HourHighs ? hour1High : na, "1H High", color=color.blue, linewidth=1, style=plot.style_line)
+plot(showKeyLevels and show4HourHighs ? hour4High : na, "4H High", color=color.red, linewidth=1, style=plot.style_line)
+
+plot(showKeyLevels and showPreviousSessionHighs ? prevSessionLow : na, "Prev Session Low", color=color.purple, linewidth=2, style=plot.style_line)
+plot(showKeyLevels and show1HourHighs ? hour1Low : na, "1H Low", color=color.blue, linewidth=1, style=plot.style_line)
+plot(showKeyLevels and show4HourHighs ? hour4Low : na, "4H Low", color=color.red, linewidth=1, style=plot.style_line)
+
+// Plot sweep signals
+plotshape(showSweeps and bullishSweep and bar_index == sweepBar, "Bullish Sweep", shape.labelup, location.belowbar, color=color.green, text="SWEEP", textcolor=color.white, size=size.normal)
+plotshape(showSweeps and bearishSweep and bar_index == sweepBar, "Bearish Sweep", shape.labeldown, location.abovebar, color=color.red, text="SWEEP", textcolor=color.white, size=size.normal)
+
+// Plot trend change signals
+plotshape(showTrendChange and trendChangeConfirmed and trendChangeType == "Bullish", "Bullish Trend Change", shape.triangleup, location.belowbar, color=color.lime, size=size.small)
+plotshape(showTrendChange and trendChangeConfirmed and trendChangeType == "Bearish", "Bearish Trend Change", shape.triangledown, location.abovebar, color=color.orange, size=size.small)
+
+// Plot entry zones
+var box entryBox = na
+if showEntryZones and waitingForEntry and not na(entryZoneHigh) and not na(entryZoneLow)
+    box.delete(entryBox)
+    boxColor = trendChangeType == "Bullish" ? color.new(color.green, 80) : color.new(color.red, 80)
+    entryBox := box.new(bar_index, entryZoneHigh, bar_index + 10, entryZoneLow, bgcolor=boxColor, border_color=color.gray)
+
+// === RESET CONDITIONS ===
+// Reset daily
+newDay = dayofmonth != dayofmonth[1]
+if newDay
+    prevSessionHighSwept := false
+    hour1HighSwept := false
+    hour4HighSwept := false
+    prevSessionLowSwept := false
+    hour1LowSwept := false
+    hour4LowSwept := false
+    trendChangeConfirmed := false
+    lookingForTrendChange := false
+    waitingForEntry := false
+    bullishSweep := false
+    bearishSweep := false
+    box.delete(entryBox)
