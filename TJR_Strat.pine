@@ -1,0 +1,286 @@
+// @version=6 
+strategy("TJR Trading Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=2, max_boxes_count=500, max_lines_count=500)
+
+// === INPUT PARAMETERS ===
+var g1 = "=== General Settings ==="
+riskRewardRatio1 = input.float(1.0, "Risk:Reward Ratio 1", minval=0.5, maxval=5.0, step=0.1, group=g1)
+riskRewardRatio2 = input.float(2.0, "Risk:Reward Ratio 2", minval=1.0, maxval=10.0, step=0.1, group=g1)
+riskRewardRatio3 = input.float(3.0, "Risk:Reward Ratio 3", minval=2.0, maxval=15.0, step=0.1, group=g1)
+partialTP1 = input.float(33.0, "TP1 Partial Close %", minval=10.0, maxval=100.0, step=5.0, group=g1) / 100
+partialTP2 = input.float(33.0, "TP2 Partial Close %", minval=10.0, maxval=100.0, step=5.0, group=g1) / 100
+
+var g2 = "=== Swing Detection ==="
+swingLength = input.int(10, "Swing High/Low Length", minval=3, maxval=50, group=g2)
+liquidityLookback = input.int(20, "Liquidity Sweep Lookback", minval=5, maxval=100, group=g2)
+
+var g3 = "=== Entry Zone Settings ==="
+useOrderBlock = input.bool(true, "Use Order Block Entry", group=g3)
+useFairValueGap = input.bool(true, "Use Fair Value Gap Entry", group=g3)
+useFibRetracement = input.bool(true, "Use 50% Fib Retracement", group=g3)
+fibRetracementLevel = input.float(0.5, "Fibonacci Retracement Level", minval=0.3, maxval=0.7, step=0.05, group=g3)
+
+var g4 = "=== Session Filter ==="
+useSessionFilter = input.bool(true, "Use Session Filter", group=g4)
+sessionStart = input.session("0800-1200", "Trading Session", group=g4)
+
+var g5 = "=== Visual Settings ==="
+showSwings = input.bool(true, "Show Swing Points", group=g5)
+showLiquiditySweeps = input.bool(true, "Show Liquidity Sweeps", group=g5)
+showEntryZones = input.bool(true, "Show Entry Zones", group=g5)
+showBOS = input.bool(true, "Show Break of Structure", group=g5)
+
+// === HELPER FUNCTIONS ===
+
+// Detect pivot highs and lows
+pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+pivotLow = ta.pivotlow(low, swingLength, swingLength)
+
+// Store swing points
+var float[] recentHighs = array.new<float>()
+var float[] recentLows = array.new<float>()
+var int[] recentHighBars = array.new<int>()
+var int[] recentLowBars = array.new<int>()
+
+// Update swing arrays
+if not na(pivotHigh)
+    array.unshift(recentHighs, pivotHigh)
+    array.unshift(recentHighBars, bar_index[swingLength])
+    if array.size(recentHighs) > liquidityLookback
+        array.pop(recentHighs)
+        array.pop(recentHighBars)
+
+if not na(pivotLow)
+    array.unshift(recentLows, pivotLow)
+    array.unshift(recentLowBars, bar_index[swingLength])
+    if array.size(recentLows) > liquidityLookback
+        array.pop(recentLows)
+        array.pop(recentLowBars)
+
+// Get most recent swing levels
+getRecentHigh() =>
+    array.size(recentHighs) > 0 ? array.get(recentHighs, 0) : na
+
+getRecentLow() =>
+    array.size(recentLows) > 0 ? array.get(recentLows, 0) : na
+
+getPreviousHigh() =>
+    array.size(recentHighs) > 1 ? array.get(recentHighs, 1) : na
+
+getPreviousLow() =>
+    array.size(recentLows) > 1 ? array.get(recentLows, 1) : na
+
+// Session filter
+inSession = useSessionFilter ? not na(time(timeframe.period, sessionStart)) : true
+
+// === LIQUIDITY SWEEP DETECTION ===
+var bool bullishLiquiditySweep = false
+var bool bearishLiquiditySweep = false
+var float liquiditySweepLow = na
+var float liquiditySweepHigh = na
+var int liquiditySweepBar = na
+
+// Detect bullish liquidity sweep
+recentLow = getRecentLow()
+if not na(recentLow) and not bullishLiquiditySweep
+    if low < recentLow and close > recentLow
+        bullishLiquiditySweep := true
+        liquiditySweepLow := recentLow
+        liquiditySweepBar := bar_index
+
+// Detect bearish liquidity sweep
+recentHigh = getRecentHigh()
+if not na(recentHigh) and not bearishLiquiditySweep
+    if high > recentHigh and close < recentHigh
+        bearishLiquiditySweep := true
+        liquiditySweepHigh := recentHigh
+        liquiditySweepBar := bar_index
+
+// === BREAK OF STRUCTURE DETECTION ===
+var bool bullishBOS = false
+var bool bearishBOS = false
+var float bosSwingHigh = na
+var float bosSwingLow = na
+var int bosBar = na
+
+// Detect bullish BOS (higher high after liquidity sweep)
+previousHigh = getPreviousHigh()
+if bullishLiquiditySweep and not bullishBOS and not na(previousHigh)
+    if high > previousHigh
+        bullishBOS := true
+        bosSwingHigh := high
+        bosSwingLow := liquiditySweepLow
+        bosBar := bar_index
+
+// Detect bearish BOS (lower low after liquidity sweep)
+previousLow = getPreviousLow()
+if bearishLiquiditySweep and not bearishBOS and not na(previousLow)
+    if low < previousLow
+        bearishBOS := true
+        bosSwingLow := low
+        bosSwingHigh := liquiditySweepHigh
+        bosBar := bar_index
+
+// === FAIR VALUE GAP DETECTION ===
+detectBullishFVG() =>
+    // Bullish FVG: low[2] > high[0]
+    low[2] > high and not na(low[2])
+
+detectBearishFVG() =>
+    // Bearish FVG: high[2] < low[0]
+    high[2] < low and not na(high[2])
+
+// === ORDER BLOCK DETECTION ===
+detectBullishOrderBlock() =>
+    // Last bearish candle before bullish impulse
+    close[1] < open[1] and close > open and (close > close[1])
+
+detectBearishOrderBlock() =>
+    // Last bullish candle before bearish impulse
+    close[1] > open[1] and close < open and (close < close[1])
+
+// === ENTRY ZONE CALCULATION ===
+var float entryZoneHigh = na
+var float entryZoneLow = na
+var bool waitingForBuyEntry = false
+var bool waitingForSellEntry = false
+
+// Calculate buy entry zone
+if bullishBOS and not waitingForBuyEntry and inSession
+    var float entryHigh = na
+    var float entryLow = na
+    entryHigh := na
+    entryLow := na
+    
+    // Order Block entry
+    if useOrderBlock and detectBullishOrderBlock()
+        entryHigh := math.max(open[1], close[1])
+        entryLow := math.min(open[1], close[1])
+    
+    // Fair Value Gap entry
+    if useFairValueGap and detectBullishFVG()
+        entryHigh := high[2]
+        entryLow := low
+        
+    // Fibonacci retracement entry
+    if useFibRetracement
+        var float fibLevel = na
+        fibLevel := bosSwingLow + (bosSwingHigh - bosSwingLow) * fibRetracementLevel
+        entryHigh := fibLevel + (bosSwingHigh - bosSwingLow) * 0.05
+        entryLow := fibLevel - (bosSwingHigh - bosSwingLow) * 0.05
+    
+    if not na(entryHigh) and not na(entryLow)
+        entryZoneHigh := entryHigh
+        entryZoneLow := entryLow
+        waitingForBuyEntry := true
+
+// Calculate sell entry zone
+if bearishBOS and not waitingForSellEntry and inSession
+    var float entryHigh = na
+    var float entryLow = na
+    entryHigh := na
+    entryLow := na
+    
+    // Order Block entry
+    if useOrderBlock and detectBearishOrderBlock()
+        entryHigh := math.max(open[1], close[1])
+        entryLow := math.min(open[1], close[1])
+    
+    // Fair Value Gap entry
+    if useFairValueGap and detectBearishFVG()
+        entryHigh := high
+        entryLow := low[2]
+        
+    // Fibonacci retracement entry
+    if useFibRetracement
+        var float fibLevel = na
+        fibLevel := bosSwingHigh - (bosSwingHigh - bosSwingLow) * fibRetracementLevel
+        entryHigh := fibLevel + (bosSwingHigh - bosSwingLow) * 0.05
+        entryLow := fibLevel - (bosSwingHigh - bosSwingLow) * 0.05
+    
+    if not na(entryHigh) and not na(entryLow)
+        entryZoneHigh := entryHigh
+        entryZoneLow := entryLow
+        waitingForSellEntry := true
+
+// === TRADE EXECUTION ===
+var float buyStopLoss = na
+var float sellStopLoss = na
+
+// Long entry
+if waitingForBuyEntry and low <= entryZoneHigh and high >= entryZoneLow
+    var float entryPrice = na
+    entryPrice := math.avg(entryZoneHigh, entryZoneLow)
+    buyStopLoss := liquiditySweepLow
+    var float riskAmount = na
+    riskAmount := entryPrice - buyStopLoss
+    
+    strategy.entry("Long", strategy.long, limit=entryPrice)
+    strategy.exit("Long TP1", from_entry="Long", qty_percent=partialTP1 * 100, profit=riskAmount * riskRewardRatio1 / syminfo.mintick)
+    strategy.exit("Long TP2", from_entry="Long", qty_percent=partialTP2 * 100, profit=riskAmount * riskRewardRatio2 / syminfo.mintick)
+    strategy.exit("Long TP3", from_entry="Long", profit=riskAmount * riskRewardRatio3 / syminfo.mintick, stop=buyStopLoss)
+    
+    waitingForBuyEntry := false
+    bullishLiquiditySweep := false
+    bullishBOS := false
+
+// Short entry
+if waitingForSellEntry and low <= entryZoneHigh and high >= entryZoneLow
+    var float entryPrice = na
+    entryPrice := math.avg(entryZoneHigh, entryZoneLow)
+    sellStopLoss := liquiditySweepHigh
+    var float riskAmount = na
+    riskAmount := sellStopLoss - entryPrice
+    
+    strategy.entry("Short", strategy.short, limit=entryPrice)
+    strategy.exit("Short TP1", from_entry="Short", qty_percent=partialTP1 * 100, profit=riskAmount * riskRewardRatio1 / syminfo.mintick)
+    strategy.exit("Short TP2", from_entry="Short", qty_percent=partialTP2 * 100, profit=riskAmount * riskRewardRatio2 / syminfo.mintick)
+    strategy.exit("Short TP3", from_entry="Short", profit=riskAmount * riskRewardRatio3 / syminfo.mintick, stop=sellStopLoss)
+    
+    waitingForSellEntry := false
+    bearishLiquiditySweep := false
+    bearishBOS := false
+
+// === VISUAL ELEMENTS ===
+
+// Plot swing points
+plotshape(showSwings and not na(pivotHigh), "Pivot High", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(showSwings and not na(pivotLow), "Pivot Low", shape.triangleup, location.belowbar, color.green, size=size.small)
+
+// Plot liquidity sweeps
+plotshape(showLiquiditySweeps and bullishLiquiditySweep and bar_index == liquiditySweepBar, "Bullish Sweep", shape.labelup, location.belowbar, color.green, text="Liq Sweep", textcolor=color.white, size=size.normal)
+plotshape(showLiquiditySweeps and bearishLiquiditySweep and bar_index == liquiditySweepBar, "Bearish Sweep", shape.labeldown, location.abovebar, color.red, text="Liq Sweep", textcolor=color.white, size=size.normal)
+
+// Plot Break of Structure
+plotshape(showBOS and bullishBOS and bar_index == bosBar, "Bullish BOS", shape.labelup, location.belowbar, color.blue, text="BOS", textcolor=color.white, size=size.normal)
+plotshape(showBOS and bearishBOS and bar_index == bosBar, "Bearish BOS", shape.labeldown, location.abovebar, color.orange, text="BOS", textcolor=color.white, size=size.normal)
+
+// Plot entry zones
+var box entryBox = na
+if showEntryZones and waitingForBuyEntry and not na(entryZoneHigh) and not na(entryZoneLow)
+    box.delete(entryBox)
+    entryBox := box.new(bar_index, entryZoneHigh, bar_index + 10, entryZoneLow, bgcolor=color.new(color.green, 80), border_color=color.green)
+
+if showEntryZones and waitingForSellEntry and not na(entryZoneHigh) and not na(entryZoneLow)
+    box.delete(entryBox)
+    entryBox := box.new(bar_index, entryZoneHigh, bar_index + 10, entryZoneLow, bgcolor=color.new(color.red, 80), border_color=color.red)
+
+// === ALERTS ===
+alertcondition(bullishLiquiditySweep, "Bullish Liquidity Sweep", "Bullish liquidity sweep detected")
+alertcondition(bearishLiquiditySweep, "Bearish Liquidity Sweep", "Bearish liquidity sweep detected")
+alertcondition(bullishBOS, "Bullish Break of Structure", "Bullish break of structure confirmed")
+alertcondition(bearishBOS, "Bearish Break of Structure", "Bearish break of structure confirmed")
+alertcondition(waitingForBuyEntry, "Buy Entry Zone", "Looking for buy entry in the zone")
+alertcondition(waitingForSellEntry, "Sell Entry Zone", "Looking for sell entry in the zone")
+
+// === RESET CONDITIONS ===
+// Reset conditions when new day starts or significant time passes
+newDay = dayofmonth != dayofmonth[1]
+if newDay
+    bullishLiquiditySweep := false
+    bearishLiquiditySweep := false
+    bullishBOS := false
+    bearishBOS := false
+    waitingForBuyEntry := false
+    waitingForSellEntry := false
+    box.delete(entryBox)
+
