@@ -1,0 +1,209 @@
+// @version=6
+strategy("ORB Strategy - 8:00-8:15 EST", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// === INPUT PARAMETERS ===
+useDate = input.bool(true, "Filter Date Range")
+fromDate = input.time(timestamp("2023-01-01"), "From Date", confirm=true)
+toDate = input.time(timestamp("2025-12-31"), "To Date", confirm=true)
+emaLength = input.int(10, "EMA Length", minval=1)
+timezoneOffset = input.int(-5, "Timezone offset from UTC (EST = -5)", minval=-12, maxval=14)
+showDebugInfo = input.bool(true, "Show Debug Info")
+lineTimeout = input.int(30, "Remove lines after X candles if no trade", minval=5, maxval=100)
+
+// === TIME FUNCTIONS ===
+// Function to convert session time to chart time with timezone adjustment
+sessionTimeToChartTime(hour, minute) =>
+    // Convert user timezone to UTC
+    utcHour = hour - timezoneOffset
+    if utcHour >= 24
+        utcHour := utcHour - 24
+    if utcHour < 0
+        utcHour := utcHour + 24
+    
+    // Convert to milliseconds
+    utcTime = utcHour * 3600 + minute * 60
+    
+    // Adjust to chart time
+    chartTime = time - time % 86400000 + utcTime * 1000
+    chartTime
+
+// Define the 8:00-8:15 AM EST time window
+sessionStartTime = sessionTimeToChartTime(8, 0)  // 8:00 AM in user's timezone
+sessionEndTime = sessionTimeToChartTime(8, 15)   // 8:15 AM in user's timezone
+
+// Check if current bar is within our defined session
+isWithinSession = time >= sessionStartTime and time < sessionEndTime
+
+// === CALCULATE ORB HIGH AND LOW ===
+// Variables to store the ORB high and low values
+var float orbHigh = na
+var float orbLow = na
+var bool orbDefined = false
+var int orbDay = 0
+var int barsAfterOrb = 0
+var bool showHighLine = false
+var bool showLowLine = false
+
+// Reset ORB values at the start of a new day
+newDay = dayofmonth != dayofmonth[1] or month != month[1] or year != year[1]
+if newDay
+    orbDefined := false
+    orbHigh := na
+    orbLow := na
+    orbDay := dayofmonth
+    barsAfterOrb := 0
+    showHighLine := false
+    showLowLine := false
+
+// Calculate ORB high and low during the 8:00-8:15 session
+if isWithinSession
+    if not orbDefined
+        // First bar of the session or continuing the session
+        if na(orbHigh) or na(orbLow)
+            orbHigh := high
+            orbLow := low
+        else
+            orbHigh := math.max(orbHigh, high)
+            orbLow := math.min(orbLow, low)
+    
+    // Mark the ORB as defined at the end of the session
+    if time >= sessionEndTime - 60000  // Last bar of the session
+        orbDefined := true
+        showHighLine := true
+        showLowLine := true
+        barsAfterOrb := 0
+
+// Increment bars counter after ORB is defined
+if orbDefined and not isWithinSession
+    barsAfterOrb := barsAfterOrb + 1
+
+// === BREAKOUT DETECTION ===
+// Variables to track if breakouts have occurred
+var bool highBroken = false
+var bool lowBroken = false
+var bool waitingForRetestHigh = false
+var bool waitingForRetestLow = false
+var bool inLongTrade = false
+var bool inShortTrade = false
+
+// Calculate EMA for trend direction
+ema = ta.ema(close, emaLength)
+emaTrend = close > ema ? 1 : -1  // 1 for uptrend, -1 for downtrend
+
+// Debug variables
+var string debugText = ""
+
+// Detect breakouts after ORB is defined
+if orbDefined and not isWithinSession and (dayofmonth == orbDay)
+    // High breakout
+    if high > orbHigh and not highBroken and not inLongTrade and not inShortTrade
+        highBroken := true
+        waitingForRetestHigh := true
+        debugText := "High Breakout Detected"
+    
+    // Low breakout
+    if low < orbLow and not lowBroken and not inLongTrade and not inShortTrade
+        lowBroken := true
+        waitingForRetestLow := true
+        debugText := "Low Breakout Detected"
+    
+    // Detect retest of high
+    if waitingForRetestHigh
+        if low <= orbHigh and close > orbHigh
+            waitingForRetestHigh := false
+            if not inLongTrade and emaTrend > 0
+                strategy.entry("Long", strategy.long)
+                inLongTrade := true
+                debugText := "Long Entry: Retest of High"
+                showHighLine := false  // Hide the high line after trade entry
+    
+    // Detect retest of low
+    if waitingForRetestLow
+        if high >= orbLow and close < orbLow
+            waitingForRetestLow := false
+            if not inShortTrade and emaTrend < 0
+                strategy.entry("Short", strategy.short)
+                inShortTrade := true
+                debugText := "Short Entry: Retest of Low"
+                showLowLine := false  // Hide the low line after trade entry
+    
+    // Exit long position when trend changes to down
+    if inLongTrade and emaTrend < 0
+        strategy.close("Long")
+        inLongTrade := false
+        highBroken := false  // Reset to look for new breakouts
+        debugText := "Long Exit: Trend Changed to Down"
+    
+    // Exit short position when trend changes to up
+    if inShortTrade and emaTrend > 0
+        strategy.close("Short")
+        inShortTrade := false
+        lowBroken := false  // Reset to look for new breakouts
+        debugText := "Short Exit: Trend Changed to Up"
+
+// Reset breakout flags at the start of a new day
+if newDay
+    highBroken := false
+    lowBroken := false
+    waitingForRetestHigh := false
+    waitingForRetestLow := false
+    inLongTrade := false
+    inShortTrade := false
+    debugText := "New Day: Reset"
+
+// Hide lines after timeout if no trade was taken
+if barsAfterOrb > lineTimeout
+    if waitingForRetestHigh and not inLongTrade
+        showHighLine := false
+        waitingForRetestHigh := false
+        highBroken := false
+        debugText := "High Line Removed: Timeout"
+    
+    if waitingForRetestLow and not inShortTrade
+        showLowLine := false
+        waitingForRetestLow := false
+        lowBroken := false
+        debugText := "Low Line Removed: Timeout"
+
+// === PLOTTING ===
+// Plot ORB high and low lines only when they should be visible
+var highLine = line.new(na, na, na, na, color=color.green, width=2)
+var lowLine = line.new(na, na, na, na, color=color.red, width=2)
+
+if orbDefined
+    // Update high line
+    if showHighLine
+        line.set_xy1(highLine, bar_index - 1, orbHigh)
+        line.set_xy2(highLine, bar_index, orbHigh)
+        line.set_color(highLine, color.green)
+        line.set_width(highLine, 2)
+    else
+        line.set_xy1(highLine, na, na)
+        line.set_xy2(highLine, na, na)
+    
+    // Update low line
+    if showLowLine
+        line.set_xy1(lowLine, bar_index - 1, orbLow)
+        line.set_xy2(lowLine, bar_index, orbLow)
+        line.set_color(lowLine, color.red)
+        line.set_width(lowLine, 2)
+    else
+        line.set_xy1(lowLine, na, na)
+        line.set_xy2(lowLine, na, na)
+
+// Plot EMA
+plot(ema, "EMA", color=color.blue, linewidth=1)
+
+// Add background color to the ORB session
+bgcolor(isWithinSession ? color.new(color.blue, 90) : na)
+
+// === STRATEGY FILTERS ===
+// Date range filter
+dateFilter = not useDate or (time >= fromDate and time <= toDate)
+
+// Apply date filter to strategy
+if not dateFilter
+    strategy.cancel_all()
+
+// Limit orders per day
+strategy.risk.max_intraday_filled_orders(10)
